@@ -1,0 +1,27 @@
+[Unit]
+Description=Telemost Rec Bot — запись встреч Яндекс Телемоста в Telegram
+After=network-online.target
+# 5 падений за 5 минут — стоп, не добивать сервер циклом перезапусков
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=%h/telemost-rec-bot
+Environment=TZ=Europe/Moscow
+ExecStart=%h/telemost-rec-bot/venv/bin/python %h/telemost-rec-bot/bot.py
+# браузеры встреч — дочерние процессы, гасятся вместе со службой; запись на диске, недоотправленное уйдёт после старта
+KillMode=control-group
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=10
+# до 2 встреч по ~0.5–1 ГБ браузера + склейка/расшифровка
+MemoryHigh=2200M
+MemoryMax=2800M
+CPUQuota=190%
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telemost-rec-bot
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,5 @@
+aiogram==3.13.1
+playwright==1.62.0
+python-dotenv>=1.0
+requests>=2.31
+aiohttp>=3.9
