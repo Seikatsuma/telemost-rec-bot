@@ -4,7 +4,7 @@
 🎙 Новая встреча — создать встречу, показать ссылку один раз в рамке, подключиться и записывать.
 ⏹ Остановить — остановить запись (одна встреча — сразу, несколько — выбор).
 📋 Статус — что сейчас пишется.
-Ссылка telemost.yandex.ru/j/… в сообщении — подключиться к ней.
+Ссылка telemost.yandex.ru/j/… в сообщении — подключиться к ней и подтвердить «я в ссылке».
 У встречи номер «Встреча №N» — во всех сообщениях он вместо ссылки (названия не даём, Егор 17.09.26).
 Редкое — командами: /login (вход в Яндекс по QR), /text (расшифровка вкл/выкл), /selftest.
 """
@@ -79,8 +79,12 @@ def allowed(user_id: int | None) -> bool:
     return user_id is not None and (config.ALLOW_ALL or is_owner(user_id))
 
 
+def allowed_chat(chat_id: int | None) -> bool:
+    return chat_id is not None and chat_id in config.ALLOWED_CHAT_IDS
+
+
 async def guard(msg: Message) -> bool:
-    if allowed(msg.from_user and msg.from_user.id):
+    if allowed(msg.from_user and msg.from_user.id) or allowed_chat(msg.chat.id):
         return True
     # Подсказка, как получить доступ: владелец добавляет id в OWNER_IDS.
     text = f"Это частный бот. Чтобы получить доступ, передайте владельцу ваш id: {msg.from_user.id}"
@@ -149,14 +153,14 @@ def live_meetings(chat_id: int | None = None) -> list[Meeting]:
 
 
 def start_meeting(url: str, chat_id: int, number: int | None = None, prepared=None,
-                  created_at: float | None = None) -> tuple[Meeting, bool]:
+                  created_at: float | None = None, confirm_join: bool = False) -> tuple[Meeting, bool]:
     mid = telemost.meeting_id(url)
     m = meetings.get(mid)
     if m and m.task and not m.task.done():
         return m, False
     number = number or next_number()
     m = Meeting(url, chat_id, send_text, finalize, number=number, prepared=prepared,
-                created_at=created_at)
+                created_at=created_at, confirm_join=confirm_join)
     meetings[mid] = m
     store.update(lambda d: d["meetings"].__setitem__(mid, {"url": url, "chat_id": chat_id, "number": number,
                                                            "added_at": m.created_at}))
@@ -347,7 +351,7 @@ async def cmd_stop(msg: Message):
 
 @dp.callback_query(F.data.startswith("stop:"))
 async def cb_stop(cq: CallbackQuery):
-    if not allowed(cq.from_user.id):
+    if not (allowed(cq.from_user.id) or (cq.message and allowed_chat(cq.message.chat.id))):
         await cq.answer("Нет доступа")
         return
     key = cq.data.split(":", 1)[1]
@@ -381,7 +385,10 @@ async def on_text(msg: Message):
             return
     # Браузер заготовки уже скачал код Телемоста — по своей ссылке бот входит на ~5 с быстрее (замер 17.09).
     prepared = await warm.take(wait=0) if telemost.meeting_id(url) not in meetings else None
-    m, new = start_meeting(url, msg.chat.id, prepared=prepared.as_tuple() if prepared else None)
+    # Владелец 23.11: по присланной ссылке подтвердить вход («да, в ссылку я вошёл») — на чужой
+    # встрече он бота не видит. У созданных кнопкой карточка и без того есть.
+    m, new = start_meeting(url, msg.chat.id, prepared=prepared.as_tuple() if prepared else None,
+                           confirm_join=True)
     if prepared:
         warm.ensure(delay=60)
     if new:

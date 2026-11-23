@@ -297,6 +297,25 @@ async def main() -> int:
     await leave("p4")
     config.MAX_SEGMENT_SEC = saved_max
 
+    # 9б. Встреча по присланной ссылке (владелец 23.11): вход бота подтверждаем — «я в ссылке»,
+    #     ровно один раз: перезаход после обрыва сообщение не повторяет.
+    notes.clear()
+    m = meeting_mod.Meeting(f"http://127.0.0.1:{port}/j/5550005", 1, notify, finalize, confirm_join=True)
+    task = asyncio.create_task(m.run())
+    check("9б. по ссылке: пришло «я в ссылке»", await wait_for(lambda: any("я в ссылке" in n for n in notes), 60),
+          str(notes))
+    joins_before = joins
+    for ws in list(sockets):
+        await ws.close()
+    sockets.clear()
+    check("9б. бот перезашёл после обрыва", await wait_for(lambda: joins > joins_before, meeting_mod.DROP_SEC + 40),
+          f"заходов {joins}")
+    await asyncio.sleep(3)
+    check("9б. «я в ссылке» один раз, перезаход молчит",
+          sum("я в ссылке" in n for n in notes) == 1, str(notes))
+    m.request_stop()
+    await asyncio.wait_for(task, 60)
+
     # Недоделанные встречи гасим до закрытия сервера — иначе cleanup ждёт их соединений вечно.
     if not task.done():
         m.request_stop()

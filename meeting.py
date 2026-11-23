@@ -75,7 +75,7 @@ class Segment:
 class Meeting:
     def __init__(self, url: str, chat_id: int, notify: Notify, finalize: Finalize, grace: int | None = None,
                  number: int | None = None, title: str | None = None, prepared=None,
-                 created_at: float | None = None):
+                 created_at: float | None = None, confirm_join: bool = False):
         self.url = url
         # prepared — заготовка из warm.py: (playwright, browser, page) уже на экране подключения этой встречи
         self.prepared = prepared
@@ -99,6 +99,10 @@ class Meeting:
         self.finished_for_good = False  # бот закончил с этой ссылкой сам — можно забыть её
         self.last_recorded_sec = 0.0
         self.camera_on = True  # после входа media_off включает камеру; в пустой встрече _watch её выключит
+        # Встреча по присланной ссылке (владелец 23.11): подтвердить вход — на чужой ссылке владельца
+        # может не быть в звонке, иначе он не узнает, что бот добрался. Один раз, перезаход — молча.
+        self.confirm_join = confirm_join
+        self.join_notified = False
 
     @property
     def label(self) -> str:
@@ -193,6 +197,10 @@ class Meeting:
                     log.info("%s: бот в звонке (%s)", self.id, "браузер заготовки" if used_warm else "новый браузер")
                     # О самом входе не сообщаем (владелец 18.09): бот входит за секунды, а люди собираются
                     # минутами — уведомление «бот зашёл» было шумом. Пишем только о том, что требует внимания.
+                    # Исключение — ссылка, присланная владельцем (23.11): там он просил «да, в ссылку я вошёл».
+                    if self.confirm_join and not self.join_notified:
+                        self.join_notified = True
+                        await self.notify(self.chat_id, f"✅ {self.label}: я в ссылке.")
                     reason = await self._watch(page)
                     log.info("%s: выход из наблюдения: %s", self.id, reason)
                     if reason == "idle":

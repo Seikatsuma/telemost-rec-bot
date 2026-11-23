@@ -372,7 +372,7 @@ async def process_segment(seg_dir: Path, send_audio: SendAudio, send_text: SendT
         dur = duration(audio) if audio else 0
         started = datetime.fromtimestamp(meta["started"])
         label = meta.get("label") or "Встреча"
-        title = f"{label} · {started:%d.%m %H:%M}"
+        title = f"{label} · {started:%d.%m %H:%M:%S}"
         if not audio or dur < 3:
             await send_text(chat, f"🔇 {label}: звука не было — присылать нечего")
         else:
@@ -404,7 +404,7 @@ async def _send_transcript(seg_dir: Path, meta: dict, chat: int, send_text: Send
     dur = duration(audio) if audio.exists() else 0
     started = datetime.fromtimestamp(meta["started"])
     label = meta.get("label") or "Встреча"
-    title = f"{label} · {started:%d.%m %H:%M}"
+    title = f"{label} · {started:%d.%m %H:%M:%S}"
     async with _text_lock:
         if audio.exists() and dur >= 20 and want_text(chat) and (config.GROQ_API_KEY
                                                                  or config.DEEPGRAM_API_KEY):
@@ -412,7 +412,7 @@ async def _send_transcript(seg_dir: Path, meta: dict, chat: int, send_text: Send
                 text = await asyncio.to_thread(transcribe, audio)
                 if text:
                     safe = re.sub(r'[\\/:*?"<>|]+', " ", label).strip()
-                    txt = seg_dir / f"Расшифровка {safe} {started:%d.%m %H-%M}.txt"
+                    txt = seg_dir / f"Расшифровка {safe} {started:%d.%m %H-%M-%S}.txt"
                     # Расшифровка — только файлом, в подписи только чья она (текста в чате не нужно).
                     # Короткий конспект — в начале того же файла, не в чате.
                     try:

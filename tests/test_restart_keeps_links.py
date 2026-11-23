@@ -26,6 +26,8 @@ class FakeMeeting:
     """Ведёт себя как Meeting: finished_for_good ставится, только если run вышел сам."""
     def __init__(self, url, chat_id, *a, number=None, prepared=None, **k):
         self.url, self.chat_id, self.number = url, chat_id, number
+        import time
+        self.created_at = k.get("created_at") or time.time()  # start_meeting кладёт его в state (окно сторожения 21.09)
         self.finished_for_good = False
         self.stop_event = asyncio.Event()
         self.task = None

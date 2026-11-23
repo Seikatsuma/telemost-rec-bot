@@ -27,6 +27,8 @@ def _int(name: str, default: int) -> int:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # Кому можно пользоваться ботом (Telegram id через запятую). Пусто — бот закрепится за первым, кто напишет /start.
 OWNER_IDS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",") if x}
+# Групповые чаты, где ботом может пользоваться любой участник (id чата, у групп отрицательный, через запятую).
+ALLOWED_CHAT_IDS = {int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x}
 # 1 — пускать всех (для открытой проверки знакомыми); встречи создаются всё равно с одного аккаунта Яндекса.
 ALLOW_ALL = os.environ.get("ALLOW_ALL", "0") == "1"
 # Что бот отвечает чужому человеку без доступа: «частный бот» + ссылка, как поднять своего.
