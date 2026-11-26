@@ -32,7 +32,7 @@ from playwright.async_api import async_playwright
 import config
 import telemost
 import timeline
-from browser_env import BOT_PAGE_INIT, BOT_VIEWPORT, UA, browser_env, chromium_args
+from browser_env import BOT_PAGE_INIT, BOT_VIEWPORT, TRACK_STREAMS_INIT, UA, browser_env, chromium_args
 
 log = logging.getLogger("meeting")
 
@@ -295,6 +295,7 @@ class Meeting:
     async def _open_page(self, browser):
         ctx = await browser.new_context(locale="ru-RU", user_agent=UA, viewport=BOT_VIEWPORT)
         await ctx.add_init_script(BOT_PAGE_INIT)
+        await ctx.add_init_script(TRACK_STREAMS_INIT)
         await ctx.add_init_script(path=str(config.ROOT / "inject.js"))
         await ctx.expose_binding("__recChunk", write_chunk)
         await ctx.expose_binding("__recEvent", timeline.write_event)

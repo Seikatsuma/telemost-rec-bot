@@ -51,8 +51,17 @@ def parse_link(text: str) -> str | None:
 
 
 def meeting_id(url: str) -> str:
-    m = LINK_RE.search(url)
+    m = LINK_RE.search(url) or re.search(r"/private-join/(\d+)", url)
     return m.group(1) if m else re.sub(r"\W+", "_", url)[-20:]
+
+
+def direct_url(url: str) -> str:
+    """Заход гостем — напрямую в кадр звонка, минуя оболочку мессенджера (замер 27.11:
+    вход за ~23 с холодным браузером против ~37 с по /j/-ссылке). Не телемост-ссылку
+    (тестовый стенд) возвращает как есть."""
+    m = LINK_RE.search(url)
+    host = re.search(r"https?://([^/]+)", url)
+    return f"https://{host.group(1)}/private-join/{m.group(1)}" if m and host else url
 
 
 async def click_any(page: Page, patterns: list[str], timeout: int = 600) -> str | None:
@@ -180,6 +189,8 @@ _NAME_VALUE_JS = """(sels) => { const e = [...document.querySelectorAll(sels)].f
   return e ? e.value : null; }"""
 # Сколько ждать, пока в поле встанет наше имя, прежде чем войти как есть (лучше «Гостем», чем никак).
 NAME_WAIT_SEC = 20
+# «Подключиться» видна, а поля имени на экране нет и не было — вариант экрана без поля: ждать его бессмысленно.
+FIELD_GRACE_SEC = 6
 CONNECT_BUTTONS = [r"^Подключиться$", r"^Присоединиться$", r"^Join$"]
 
 
@@ -256,6 +267,27 @@ async def set_frozen(page: Page, frozen: bool) -> None:
         log.warning("заморозка страницы (%s): %s", frozen, e)
 
 
+_STOP_TRACKS_JS = """() => {
+  let n = 0;
+  const stop = s => { try { s && s.getTracks().forEach(t => { t.stop(); n++; }); } catch (e) {} };
+  for (const v of document.querySelectorAll('video,audio')) stop(v.srcObject);
+  for (const s of (window.__streams || [])) stop(s);
+  return n;
+}"""
+
+
+async def stop_tracks(page: Page) -> int:
+    """Остановить все медиатреки страницы: фейковые камера/микрофон замолкают — меньше CPU.
+    __streams заполняет TRACK_STREAMS_INIT (browser_env), srcObject — то, что дорисовал превью."""
+    n = 0
+    for fr in _frames(page):
+        try:
+            n += await fr.evaluate(_STOP_TRACKS_JS) or 0
+        except Exception:
+            continue
+    return n
+
+
 async def leave(page: Page) -> None:
     """Выйти из встречи кнопкой — участники сразу видят, что бот ушёл (а не через тайм-аут соединения)."""
     for surface in await _surfaces(page):
@@ -269,7 +301,7 @@ async def leave(page: Page) -> None:
 async def _goto(page: Page, url: str) -> bool:
     for attempt in range(3):
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(url, wait_until="commit", timeout=60000)
             return True
         except Exception as e:  # CDN Телемоста иногда не отвечает — повтор
             log.warning("goto %s попытка %d: %s", url, attempt + 1, e)
@@ -302,7 +334,7 @@ async def _clear_overlays(page: Page) -> None:
 async def prepare(page: Page, url: str, bot_name: str, timeout: float = 90) -> str:
     """Открыть встречу и остановиться на экране подключения: имя введено, камера и микрофон выключены,
     кнопка «Подключиться» видна. Потом join(..., prepared=True) входит за секунды. ready | not_found | failed."""
-    if not await _goto(page, url):
+    if not await _goto(page, direct_url(url)):
         return "failed"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -319,58 +351,126 @@ async def prepare(page: Page, url: str, bot_name: str, timeout: float = 90) -> s
     return "failed"
 
 
+# Один лёгкий вызов на кадр вместо пачки evaluate (ускорение входа 27.11: раньше каждая итерация
+# цикла входа стоила 3–7 с — snapshot+body_text+fill_name+media_off по всем кадрам — и бот входил
+# 20–40 с). Жмёт подготовительные кнопки (всё, кроме «Подключиться» — её жмём только с именем)
+# и отвечает, что на экране: поле имени, его значение, кнопка «Подключиться».
+_PROBE_JS = """(arg) => {
+  const nameSels = arg[0], clickPats = arg[1];
+  const vis = e => !!e.getClientRects().length && !e.disabled;
+  const nameEl = [...document.querySelectorAll(nameSels)].find(vis);
+  const els = [...document.querySelectorAll('button,[role=button],[role=menuitem],a')].filter(vis);
+  let clicked = null;
+  for (const p of clickPats) {
+    const r = new RegExp(p, 'i');
+    const e = els.find(x => [(x.innerText || '').trim(), x.getAttribute('aria-label') || '', x.title || '']
+      .some(t => t && r.test(t)));
+    if (e) { e.click(); clicked = p; break; }
+  }
+  const conn = /^(Подключиться|Присоединиться|Join)$/i;
+  return {namePresent: !!nameEl, nameValue: nameEl ? nameEl.value : null,
+          connect: els.some(e => conn.test((e.innerText || '').trim())), clicked};
+}"""
+
+# Кнопки, которые жмём всегда, как только видны (предэкраны и окна). «Подключиться» сюда не входит —
+# её жмём отдельно и только когда в поле уже наше имя.
+AUTO_CLICK_PATS = ([b for b in JOIN_BUTTONS if b not in CONNECT_BUTTONS]
+                   + COOKIE_BUTTONS + ONBOARDING_BUTTONS)
+
+
 async def join(page: Page, url: str, bot_name: str,
                on_waiting: Callable[[], Awaitable[None]] | None = None,
                stop_event: asyncio.Event | None = None, mute: bool = True, prepared: bool = False) -> str:
     """Зайти во встречу гостем. Возвращает joined | not_found | failed | stopped.
     prepared=True — страница уже на экране подключения (warm.py), без повторной загрузки."""
-    if not prepared and not await _goto(page, url):
+    t0 = time.monotonic()
+    if not prepared and not await _goto(page, direct_url(url)):
         return "failed"
+    log.info("%s: страница загружена за %.1f с", meeting_id(url), time.monotonic() - t0)
 
     name = bot_name
+    name_sels = ", ".join(NAME_SELECTORS)
     waiting_told = False
     started = time.monotonic()
     deadline = started + 90
     name_warned = False
+    screen_at = None   # экран подключения впервые виден
+    name_ever = False  # поле имени когда-либо было на экране
+    ready_at = None    # в поле встало наше имя
+    clicked_at = 0.0   # последний клик «Подключиться»
+    heavy_at = 0.0     # последняя тяжёлая проверка (сигналинг/тексты)
+    media_at = 0.0     # последнее выключение камеры/микрофона
+    fill_fails = 0
     while time.monotonic() < deadline:
         if stop_event is not None and stop_event.is_set():
             return "stopped"
-        snap = await snapshot(page, bot_name)
-        if snap and snap.get("signalingEverOpen"):
-            if mute:
-                await page.wait_for_timeout(300)
-                await media_off(page)
-            return "joined"
-        text = await body_text(page)
-        if "встречи не существует" in text or "Встреча завершена" in text:
-            return "not_found"
-        if re.search(r"ожидани|впуст|организатор скоро", text, re.I):
-            # Зал ожидания: ждём дольше и один раз говорим, что бота надо впустить.
-            if not waiting_told and on_waiting:
-                waiting_told = True
-                await on_waiting()
-            if time.monotonic() - started < WAITING_ROOM_MAX_SEC:
-                deadline = max(deadline, time.monotonic() + 30)
-        if "Некорректное имя" in text and name != "Zapis vstrechi":
-            name = "Zapis vstrechi" if name == "Запись встречи" else "Запись встречи"
-        await _clear_overlays(page)
-        await fill_name(page, name)
-        if mute:
-            await media_off(page)  # на экране подготовки — чтобы бот вошёл уже без камеры и микрофона
-        # «Подключиться» — только когда в поле уже наше имя: 24.09.26 на боевой встрече бот нажал
-        # раньше, чем поле встало, и вошёл «Гостем» — люди не поняли, что это бот записи.
-        ready = await name_ready(page, name)
-        buttons = JOIN_BUTTONS
-        if not ready:
-            if time.monotonic() - started < NAME_WAIT_SEC:
-                buttons = [b for b in JOIN_BUTTONS if b not in CONNECT_BUTTONS]
-            elif not name_warned:
+        now = time.monotonic()
+        # Раз в секунду — дорогие проверки: вошли ли уже, жива ли ссылка, не зал ли ожидания.
+        if now - heavy_at >= 1.0:
+            heavy_at = now
+            snap = await snapshot(page, bot_name)
+            if snap and snap.get("signalingEverOpen"):
+                if mute:
+                    await page.wait_for_timeout(300)
+                    await media_off(page)
+                log.info("%s: в звонке через %.1f с", meeting_id(url), now - t0)
+                return "joined"
+            text = await body_text(page)
+            if "встречи не существует" in text or "Встреча завершена" in text:
+                return "not_found"
+            if re.search(r"ожидани|впуст|организатор скоро", text, re.I):
+                # Зал ожидания: ждём дольше и один раз говорим, что бота надо впустить.
+                if not waiting_told and on_waiting:
+                    waiting_told = True
+                    await on_waiting()
+                if now - started < WAITING_ROOM_MAX_SEC:
+                    deadline = max(deadline, now + 30)
+            if "Некорректное имя" in text and name != "Zapis vstrechi":
+                name = "Zapis vstrechi" if name == "Запись встречи" else "Запись встречи"
+        # Лёгкий опрос всех кадров: одно evaluate жмёт подготовительные кнопки и снимает состояние экрана.
+        for fr in _frames(page):
+            try:
+                probe = await fr.evaluate(_PROBE_JS, [name_sels, AUTO_CLICK_PATS])
+            except Exception:
+                continue
+            if not isinstance(probe, dict):
+                continue
+            have_field = bool(probe.get("namePresent"))
+            have_name = have_field and (probe.get("nameValue") or "").strip() == name
+            if not (have_field or probe.get("connect")):
+                continue
+            if screen_at is None:
+                screen_at = now
+                log.info("%s: экран подключения через %.1f с", meeting_id(url), now - t0)
+            if mute and now - media_at >= 1.5:
+                media_at = now
+                await media_off(page)  # на экране подготовки — чтобы бот вошёл уже без камеры и микрофона
+            if have_field:
+                name_ever = True
+                if not have_name:
+                    try:
+                        await fr.locator(name_sels).first.fill(name, timeout=1500)
+                    except Exception as e:
+                        fill_fails += 1
+                        if fill_fails == 5:
+                            log.warning("%s: имя не заполняется (%s)", meeting_id(url), e)
+                elif ready_at is None:
+                    ready_at = now
+                    log.info("%s: имя встало через %.1f с", meeting_id(url), now - t0)
+            if not (probe.get("connect") and now - clicked_at > 5):
+                continue
+            # «Подключиться» — только когда в поле уже наше имя: 24.09.26 на боевой встрече бот нажал
+            # раньше, чем поле встало, и вошёл «Гостем» — люди не поняли, что это бот записи.
+            late = now - started > NAME_WAIT_SEC
+            no_field = not have_field and not name_ever and now - screen_at > FIELD_GRACE_SEC
+            if late and not name_warned:
                 name_warned = True
                 log.warning("имя «%s» не встало за %d с — вхожу как есть", name, NAME_WAIT_SEC)
-        hit = None
-        for surface in await _surfaces(page):
-            hit = hit or await click_js(surface, buttons)
-        await page.wait_for_timeout(1000 if hit else 700)
+            if have_name or no_field or late:
+                clicked_at = now
+                log.info("%s: жму «Подключиться» через %.1f с", meeting_id(url), now - t0)
+                await click_js(fr, CONNECT_BUTTONS)
+        await page.wait_for_timeout(300)
     await page.screenshot(path=str(config.LOG_DIR / f"join-failed-{meeting_id(url)}.png"))
     log.warning("не вошёл за 90 с, кадры: %s", [f.url[:60] for f in _frames(page)])
     return "failed"

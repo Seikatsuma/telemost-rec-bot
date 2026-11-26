@@ -17,6 +17,16 @@ import config  # noqa: F401 — загружает .env (BROWSER_SYSLIBS и др
 BOT_VIEWPORT = {"width": 640, "height": 360}
 BOT_PAGE_INIT = ("(() => { window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 1000); })();")
 
+# Запоминаем все потоки getUserMedia в window.__streams: их треки потом останавливаются разом —
+# фейковые камера/микрофон, работающие на припаркованной странице заготовки, ели ~30–40 % ядра
+# (замер 27.11: после остановки треков + заморозки страницы остаётся ~17 %).
+TRACK_STREAMS_INIT = ("""(() => {
+  const g = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia = async c => {
+    const s = await g(c); (window.__streams = window.__streams || []).push(s); return s;
+  };
+})();""")
+
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/139.0.0.0 Safari/537.36")
 

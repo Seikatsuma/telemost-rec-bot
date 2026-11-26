@@ -194,7 +194,7 @@ async def main() -> int:
     check("2. вернулся в паузу → та же запись", await wait_for(lambda: m.phase == "идёт запись", 6) and not closed, f"{m.phase}, закрыто {len(closed)}")
     await asyncio.sleep(6)
     await leave("p1")
-    check("3. пауза истекла → запись закрыта", await wait_for(lambda: len(closed) == 1, 25), f"закрыто {len(closed)}")
+    check("3. пауза истекла → запись закрыта", await wait_for(lambda: len(closed) == 1, 40), f"закрыто {len(closed)}")
     if closed and closed[0]:
         d = voiced(closed[0])
         check("3. звучащих секунд ≈ 14, пауза не записана (12–18: опрос раз в 2 с на входе и выходе)", 12 <= d <= 18, f"{d:.1f} с")

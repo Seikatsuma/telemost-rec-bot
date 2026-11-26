@@ -5,8 +5,13 @@
 Заготовка делает всё это заранее, в фоне: создаёт встречу и держит браузер бота на её экране подключения
 (имя введено, камера и микрофон выключены). По кнопке ссылка отдаётся сразу, а боту остаётся нажать «Подключиться».
 Сразу после выдачи готовится следующая заготовка. Страница обновляется раз в REFRESH_SEC, чтобы не протухла.
-Цена: один лишний браузер без звонка (~250 МБ, почти без CPU) и неиспользованные встречи в аккаунте Телемоста —
-новая создаётся только когда заготовку забрали или она сломалась.
+Цена: один лишний браузер без звонка (~250 МБ, ~17 % ядра припаркованным) и неиспользованные встречи
+в аккаунте Телемоста — новая создаётся только когда заготовку забрали или она сломалась.
+
+Парковка 27.11: страница остаётся на экране подключения (вход по кнопке ~6 с против ~43 с с перезагрузкой),
+но чтобы фейковые камера и микрофон не ели ~30–40 % ядра, треки останавливаются (stop_tracks) и страница
+замораживается (set_frozen). take() размораживает. Тот же браузер достаётся и присланной ссылке —
+под чужой URL она перезагружается, но код Телемоста уже в кэше.
 """
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ from playwright.async_api import async_playwright
 import config
 import telemost
 import timeline
-from browser_env import BOT_PAGE_INIT, BOT_VIEWPORT, UA, browser_env, chromium_args
+from browser_env import BOT_PAGE_INIT, BOT_VIEWPORT, TRACK_STREAMS_INIT, UA, browser_env, chromium_args
 from meeting import write_chunk
 
 log = logging.getLogger("warm")
@@ -28,6 +33,13 @@ log = logging.getLogger("warm")
 REFRESH_SEC = 20 * 60
 HEALTH_SEC = 30
 RETRY_SEC = 120
+
+
+async def _park(page) -> None:
+    """Припарковать страницу на экране подключения: остановить фейковые камеру/микрофон
+    (иначе ~30–40 % ядра на пустой странице) и заморозить. Замер 27.11 — ~17 % ядра."""
+    await telemost.stop_tracks(page)
+    await telemost.set_frozen(page, True)
 
 
 @dataclass
@@ -79,6 +91,9 @@ class Warm:
         if prepared.page.is_closed():
             await self._dispose(prepared)
             return None
+        # Страница припаркована замороженной — разбудить: на замороженной не выполняется JS
+        # (все evaluate в join/prepare молча упали бы).
+        await telemost.set_frozen(prepared.page, False)
         log.info("заготовка выдана: %s (готова %d с назад)", prepared.url, time.monotonic() - prepared.ready_at)
         return prepared
 
@@ -94,6 +109,7 @@ class Warm:
         browser.on("disconnected", lambda _: log.warning("браузер заготовки отключился"))
         ctx = await browser.new_context(locale="ru-RU", user_agent=UA, viewport=BOT_VIEWPORT)
         await ctx.add_init_script(BOT_PAGE_INIT)
+        await ctx.add_init_script(TRACK_STREAMS_INIT)
         await ctx.add_init_script(path=str(config.ROOT / "inject.js"))
         await ctx.expose_binding("__recChunk", write_chunk)
         await ctx.expose_binding("__recEvent", timeline.write_event)
@@ -114,30 +130,35 @@ class Warm:
             prepared = Prepared(pw, browser, page, url, time.monotonic())
             if res != "ready":
                 raise RuntimeError(f"экран подключения не готов: {res}")
-            # Замер 17.09: браузер на экране подключения (даже замороженном) ~40 % ядра — работают фейковые камера
-            # и микрофон. Поэтому код Телемоста загружаем один раз (ляжет в кэш) и уходим на пустую страницу.
-            await page.goto("about:blank")
+            await _park(page)
             self.ready = prepared
             log.info("заготовка готова: %s", url)
             while True:
                 await asyncio.sleep(HEALTH_SEC)
                 if self.ready is not prepared:
                     return
-                if prepared.page.is_closed() or not prepared.browser.is_connected():
-                    log.warning("браузер заготовки умер — поднимаю заново")
-                    self.not_refreshing.clear()
-                    try:
+                dead = prepared.page.is_closed() or not prepared.browser.is_connected()
+                stale = time.monotonic() - prepared.ready_at > REFRESH_SEC
+                if not dead and not stale:
+                    continue
+                self.not_refreshing.clear()
+                try:
+                    if dead:
+                        log.warning("браузер заготовки умер — поднимаю заново")
                         try:
                             await asyncio.wait_for(prepared.browser.close(), timeout=10)
                         except Exception:
                             pass
                         prepared.browser, prepared.page = await self._open(pw)
-                        if await telemost.prepare(prepared.page, url, config.BOT_NAME) != "ready":
-                            raise RuntimeError("заготовка не поднялась")
-                        await prepared.page.goto("about:blank")
-                        prepared.ready_at = time.monotonic()
-                    finally:
-                        self.not_refreshing.set()
+                    else:
+                        log.info("обновляю страницу заготовки")
+                        await telemost.set_frozen(prepared.page, False)
+                    if await telemost.prepare(prepared.page, url, config.BOT_NAME) != "ready":
+                        raise RuntimeError("заготовка не поднялась")
+                    await _park(prepared.page)
+                    prepared.ready_at = time.monotonic()
+                finally:
+                    self.not_refreshing.set()
         except asyncio.CancelledError:
             raise
         except telemost.NotLoggedIn:
