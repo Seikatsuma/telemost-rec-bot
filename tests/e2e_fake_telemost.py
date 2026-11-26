@@ -316,6 +316,35 @@ async def main() -> int:
     m.request_stop()
     await asyncio.wait_for(task, 60)
 
+    # 10. «⏸ Пауза» (владелец 27.11): при записи — запись закрыта и отправлена, бот вышел из звонка;
+    #     «продолжить» — вернулся и пишет при людях новой записью; стоп — конец.
+    notes.clear()
+    lefts_before = lefts
+    m = meeting_mod.Meeting(f"http://127.0.0.1:{port}/j/5550006", 1, notify, finalize)
+    task = asyncio.create_task(m.run())
+    check("10. бот зашёл", await wait_for(lambda: m.phase.startswith("во встрече"), 60), m.phase)
+    await enter("p5", "Павел")
+    check("10. запись идёт", await wait_for(lambda: m.phase == "идёт запись", 15), m.phase)
+    await asyncio.sleep(5)
+    closed_before = len(closed)
+    check("10. request_pause принят", m.request_pause())
+    check("10. бот вышел из звонка кнопкой", await wait_for(lambda: lefts > lefts_before, 30), f"выходов {lefts}")
+    check("10. встреча на паузе, запись закрыта и ушла",
+          await wait_for(lambda: m.paused and len(closed) > closed_before, 30),
+          f"paused={m.paused}, закрыто {len(closed) - closed_before}")
+    check("10. повторная пауза — отказ", not m.request_pause())
+    joins_before = joins
+    check("10. request_resume принят", m.request_resume())
+    check("10. бот вернулся в звонок", await wait_for(lambda: joins > joins_before, 60), f"заходов {joins}")
+    check("10. не на паузе после возврата", await wait_for(lambda: not m.paused, 15), m.phase)
+    await enter("p6", "Рита")
+    check("10. после «продолжить» — новая запись при людях",
+          await wait_for(lambda: m.segment is not None and m.phase == "идёт запись", 20), m.phase)
+    await leave("p6")
+    m.request_stop()
+    await asyncio.wait_for(task, 60)
+    check("10. стоп на паузе/после возврата — встреча закончена", task.done() and m.finished_for_good)
+
     # Недоделанные встречи гасим до закрытия сервера — иначе cleanup ждёт их соединений вечно.
     if not task.done():
         m.request_stop()
@@ -328,7 +357,7 @@ async def main() -> int:
     # у каждой закрытой записи должен лежать ≥1 webm, у совсем короткой — единственный кусок.
     # Замер только после остановки: у ещё идущей записи первый кусок может просто не дойти.
     no_audio = [d.name for d in config.REC_DIR.iterdir() if d.is_dir() and not list(d.glob("part*.webm"))]
-    check("10. финальный кусок не потерян: во всех записях есть webm", not no_audio, str(no_audio))
+    check("11. финальный кусок не потерян: во всех записях есть webm", not no_audio, str(no_audio))
 
     await runner.cleanup()
     print("ИТОГ:", "всё прошло" if not fails else f"провалено {len(fails)}: {fails}")

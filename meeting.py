@@ -8,6 +8,8 @@
   записать снова — прислать ссылку ещё раз;
 - бота выкинуло / упал браузер → заходит заново, открытая запись продолжается (новый кусок того же файла);
 - все вышли и пауза истекла → запись закрыта и отправлена, бот ОСТАЁТСЯ во встрече и ждёт: пришли снова — новая запись;
+- «⏸ Пауза» владельца → открытая запись закрыта и отправлена, бот ВЫХОДИТ из звонка и ждёт «продолжить»
+  до конца окна сторожения; «продолжить» → заходит заново и пишет при людях (новая запись);
 - пока во встрече пусто, камера бота выключена и запись не идёт (почти без CPU);
 - прошёл IDLE_LEAVE_SEC от создания ссылки (по умолчанию час) и запись не идёт → бот выходит сам.
 Камера и микрофон бота выключены кнопками Телемоста (telemost.media_off) — у участников перечёркнуты.
@@ -103,6 +105,11 @@ class Meeting:
         # может не быть в звонке, иначе он не узнает, что бот добрался. Один раз, перезаход — молча.
         self.confirm_join = confirm_join
         self.join_notified = False
+        # Пауза (владелец 27.11): бот сохраняет запись и ВЫХОДИТ из звонка (экономит процессор),
+        # встреча ждёт «продолжить» до конца окна сторожения ссылки. «Остановить» — конец в любой момент.
+        self.pause_event = asyncio.Event()
+        self.resume_event = asyncio.Event()
+        self.paused = False
 
     @property
     def label(self) -> str:
@@ -130,6 +137,8 @@ class Meeting:
                 f"Аудио пришлю сейчас, расшифровку — как будет готова. " + tail)
 
     def short_state(self) -> str:
+        if self.paused:
+            return "на паузе"
         if self.segment and self.segment.empty_since:
             return "все вышли"
         if self.segment:
@@ -139,7 +148,9 @@ class Meeting:
     # ---------- статус для кнопки «Статус» ----------
     def status(self) -> str:
         seg = self.segment
-        if seg and seg.empty_since:
+        if self.paused:
+            what = f"⏸ пауза — «Продолжить» вернёт меня (ещё {config.window_words(self.watch_left_sec())})"
+        elif seg and seg.empty_since:
             left = max(0, int(self.grace - (time.monotonic() - seg.empty_since)))
             what = f"все вышли, жду {left // 60}:{left % 60:02d}"
         elif seg:
@@ -155,6 +166,25 @@ class Meeting:
     def request_stop(self) -> None:
         self.stop_event.set()
 
+    def request_pause(self) -> bool:
+        """Поставить на паузу: сохранить запись и выйти из звонка до «продолжить» или конца окна сторожения."""
+        if self.paused or self.stop_event.is_set():
+            return False
+        self.pause_event.set()
+        return True
+
+    def request_resume(self) -> bool:
+        """«Продолжить»: ещё в звонке — отменить выход; уже вышел — вернуться."""
+        if self.stop_event.is_set() or self.finished_for_good:
+            return False
+        if self.paused:
+            self.resume_event.set()
+            return True
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            return True
+        return False
+
     # ---------- жизненный цикл ----------
     async def run(self) -> None:
         fails = 0
@@ -163,6 +193,7 @@ class Meeting:
         pw = first[0] if first else await async_playwright().start()
         try:
             while not self.stop_event.is_set():
+                reason = None
                 if first:
                     _, browser, page = first
                     # Заготовка своей встречи — уже на экране подключения; чужой ссылки — браузер с кэшем Телемоста, открыть ссылку.
@@ -210,7 +241,8 @@ class Meeting:
                         break
                     if reason == "stop":
                         break
-                    self.phase = "связь прервалась, захожу заново"
+                    if reason != "pause":  # паузу обработаем после закрытия браузера — ниже
+                        self.phase = "связь прервалась, захожу заново"
                 except Exception:
                     log.exception("%s: сбой браузера", self.id)
                     self.phase = "сбой браузера, захожу заново"
@@ -220,6 +252,21 @@ class Meeting:
                         await asyncio.wait_for(browser.close(), timeout=30)
                     except Exception:
                         pass
+                if reason == "pause":
+                    # Пауза (владелец 27.11): бот вышел, запись сохранена и ушла в чат. Ждём «продолжить»
+                    # до конца окна сторожения; «Остановить» или истёкшее окно — конец работы со ссылкой.
+                    self.paused = True
+                    self.phase = "на паузе — жду «продолжить»"
+                    resumed = await self._wait_resume()
+                    self.paused = False
+                    if not resumed:
+                        if not self.stop_event.is_set():
+                            await self.notify(self.chat_id,
+                                              f"⏹ {self.label}: час на паузе истёк — закончил с этой ссылкой. "
+                                              "Для новой записи пришлите ссылку ещё раз.")
+                        break
+                    self.phase = "снова захожу во встречу"
+                    continue
                 await self._sleep(10)
                 # Бот вне встречи дольше паузы — открытая запись закрывается, чтобы не держать её вечно.
                 if self.segment and self.segment.empty_since and time.monotonic() - self.segment.empty_since > self.grace:
@@ -263,6 +310,18 @@ class Meeting:
         except asyncio.TimeoutError:
             pass
 
+    async def _wait_resume(self) -> bool:
+        """Пауза: ждать «продолжить» до конца окна сторожения ссылки (само окно идёт от её создания).
+        True — возвращаемся в звонок; False — стоп владельцем или окно истекло."""
+        while not self.stop_event.is_set():
+            if self.resume_event.is_set():
+                self.resume_event.clear()
+                return True
+            if self.watch_left_sec() <= 0:
+                return False
+            await self._sleep(2)
+        return False
+
     # ---------- наблюдение ----------
     @staticmethod
     def _service_memory_mb() -> int | None:
@@ -280,6 +339,17 @@ class Meeting:
         while True:
             if self.stop_event.is_set():
                 return "stop"
+            if self.pause_event.is_set():
+                # Пауза: открытую запись закрыть и отправить, выйти кнопкой — участники видят уход сразу.
+                self.pause_event.clear()
+                if self.segment:
+                    self.last_recorded_sec = self.segment.active_sec
+                    await self._close_segment(page)
+                try:
+                    await telemost.leave(page)
+                except Exception:
+                    pass
+                return "pause"
             snap = await telemost.snapshot(page, config.BOT_NAME)
             if snap is None:
                 return "dropped"

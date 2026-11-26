@@ -3,6 +3,7 @@
 Управление кнопками под полем ввода (кнопки вместо команд, тексты короче, ссылку не повторять):
 🎙 Новая встреча — создать встречу, показать ссылку один раз в рамке, подключиться и записывать.
 ⏹ Остановить — остановить запись (одна встреча — сразу, несколько — выбор).
+⏸ Пауза — бот сохранит запись и выйдет из звонка до «▶️ Продолжить» (в статусе и подтверждении).
 📋 Статус — что сейчас пишется.
 Ссылка telemost.yandex.ru/j/… в сообщении — подключиться к ней и подтвердить «я в ссылке».
 У встречи номер «Встреча №N» — во всех сообщениях он вместо ссылки (названия не даём, Егор 17.09.26).
@@ -45,16 +46,17 @@ account = telemost.YandexAccount()
 warm = Warm(account)  # заготовка встречи: ссылка сразу, бот входит за секунды
 meetings: dict[str, Meeting] = {}
 
-BTN_NEW, BTN_STOP, BTN_STATUS = "🎙 Новая встреча", "⏹ Остановить", "📋 Статус"
+BTN_NEW, BTN_STOP, BTN_STATUS, BTN_PAUSE = "🎙 Новая встреча", "⏹ Остановить", "📋 Статус", "⏸ Пауза"
 KB = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_STOP)],
-                                   [KeyboardButton(text=BTN_STATUS)]],
+                                   [KeyboardButton(text=BTN_PAUSE), KeyboardButton(text=BTN_STATUS)]],
                          resize_keyboard=True, is_persistent=True)
 
 HELP = (
     "Записываю встречи в Яндекс Телемосте.\n\n"
     f"{BTN_NEW} — создам ссылку, запишу разговор\n"
     "🔗 Или пришлите свою ссылку на встречу\n"
-    f"{BTN_STOP} — закончить запись сейчас\n\n"
+    f"{BTN_STOP} — закончить запись сейчас\n"
+    f"{BTN_PAUSE} — бот сохранит запись и выйдет; «Продолжить» — вернёт его в звонок\n\n"
     f"Все вышли → через {config.GRACE_SEC} с скажу, что встреча закончилась, сразу пришлю аудио, расшифровку — следом.\n"
     f"Вернулись по той же ссылке в течение {config.window_words()} после её создания → запишу снова.\n"
     f"Слежу за {config.MAX_MEETINGS} последними ссылками: новая вытесняет самую старую."
@@ -183,7 +185,22 @@ def start_meeting(url: str, chat_id: int, number: int | None = None, prepared=No
 def stop_text(m: Meeting) -> str:
     if m.segment:
         return f"⏹ {m.label}: запись остановлена, бот отключается. Аудио и расшифровка — следом."
+    if m.ever_recorded:
+        return f"⏹ {m.label}: бот отключается. Запись уже в чате выше."
     return f"⏹ {m.label}: бот отключается. Записи не было — присылать нечего."
+
+
+def pause_text(m: Meeting) -> str:
+    """Ответ на «⏸ Пауза»: бот сохранит запись и выйдет из звонка, «Продолжить» вернёт (владелец 27.11)."""
+    left = config.window_words(m.watch_left_sec())
+    if m.segment:
+        return (f"⏸ {m.label}: выхожу на паузу — запись сохраню и пришлю. "
+                f"«Продолжить» — вернусь в звонок (сторожу ещё {left}).")
+    return f"⏸ {m.label}: выхожу на паузу. «Продолжить» — вернусь в звонок (сторожу ещё {left})."
+
+
+def resume_text(m: Meeting) -> str:
+    return f"▶️ {m.label}: продолжаю — захожу в звонок."
 
 
 def make_room() -> tuple[bool, list[Meeting]]:
@@ -327,7 +344,13 @@ async def cmd_status(msg: Message):
         await msg.answer("Сейчас встреч нет.", reply_markup=KB)
         return
     for m in live:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"⏹ Остановить {m.label}", callback_data=f"stop:{m.id}")]])
+        if m.paused:
+            mid_btn = InlineKeyboardButton(text=f"▶️ Продолжить {m.label}", callback_data=f"resume:{m.id}")
+        else:
+            mid_btn = InlineKeyboardButton(text=f"⏸ Пауза {m.label}", callback_data=f"pause:{m.id}")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [mid_btn],
+            [InlineKeyboardButton(text=f"⏹ Остановить {m.label}", callback_data=f"stop:{m.id}")]])
         await msg.answer(m.status(), reply_markup=kb)
 
 
@@ -349,6 +372,33 @@ async def cmd_stop(msg: Message):
         await msg.answer(f"Идут {len(live)} встречи. Какую остановить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
+@dp.message(Command("pause"))
+@dp.message(F.text == BTN_PAUSE)
+async def cmd_pause(msg: Message):
+    if not await guard(msg):
+        return
+    live = live_meetings(msg.chat.id)
+    pausable = [m for m in live if not m.paused]
+    if not live:
+        await msg.answer("Сейчас встреч нет.", reply_markup=KB)
+    elif not pausable:
+        # Всё живое уже на паузе — предложить «продолжить».
+        rows = [[InlineKeyboardButton(text=f"▶️ Продолжить {m.label}", callback_data=f"resume:{m.id}")] for m in live]
+        await msg.answer("Все встречи на паузе. Какую продолжить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    elif len(pausable) == 1:
+        m = pausable[0]
+        m.request_pause()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"▶️ Продолжить {m.label}", callback_data=f"resume:{m.id}")],
+            [InlineKeyboardButton(text=f"⏹ Остановить {m.label}", callback_data=f"stop:{m.id}")]])
+        await msg.answer(pause_text(m), reply_markup=kb)
+    else:
+        rows = [[InlineKeyboardButton(text=f"⏸ {m.label} — {m.short_state()}", callback_data=f"pause:{m.id}")] for m in pausable]
+        rows.append([InlineKeyboardButton(text="⏸ Все встречи", callback_data="pause:*")])
+        await msg.answer(f"Идут {len(pausable)} встречи. Какую поставить на паузу?",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
 @dp.callback_query(F.data.startswith("stop:"))
 async def cb_stop(cq: CallbackQuery):
     if not (allowed(cq.from_user.id) or (cq.message and allowed_chat(cq.message.chat.id))):
@@ -365,6 +415,34 @@ async def cb_stop(cq: CallbackQuery):
         m.request_stop()
     await cq.answer("Останавливаю")
     await cq.message.edit_text("\n".join(stop_text(m) for m in targets))
+
+
+@dp.callback_query(F.data.startswith(("pause:", "resume:")))
+async def cb_pause_resume(cq: CallbackQuery):
+    if not (allowed(cq.from_user.id) or (cq.message and allowed_chat(cq.message.chat.id))):
+        await cq.answer("Нет доступа")
+        return
+    action, _, key = cq.data.partition(":")
+    mine = live_meetings(cq.message.chat.id)
+    targets = mine if key == "*" else [m for m in mine if m.id == key]
+    if action == "pause":
+        targets = [m for m in targets if not m.paused]
+        if not targets:
+            await cq.answer("Уже на паузе")
+            return
+        for m in targets:
+            m.request_pause()
+        await cq.answer("Ставлю на паузу")
+        await cq.message.edit_text("\n".join(pause_text(m) for m in targets))
+    else:
+        changed = [m for m in targets if m.request_resume()]
+        if not changed:
+            await cq.answer("Уже идёт" if targets else "Встреча закончилась")
+            if not targets:
+                await cq.message.edit_text("Эта встреча уже закончилась.")
+            return
+        await cq.answer("Продолжаю")
+        await cq.message.edit_text("\n".join(resume_text(m) for m in changed))
 
 
 @dp.message(F.text | F.caption)
@@ -392,8 +470,12 @@ async def on_text(msg: Message):
     if prepared:
         warm.ensure(delay=60)
     if new:
+        # Управление — сразу под карточкой (владелец 27.11): пауза «вышел, но вернётся» и стоп «конец».
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⏸ Пауза {m.label}", callback_data=f"pause:{m.id}")],
+            [InlineKeyboardButton(text=f"⏹ Остановить {m.label}", callback_data=f"stop:{m.id}")]])
         await msg.answer(f"🔗 {m.label}: ссылку принял. Запись начнётся сама, как только кто-нибудь зайдёт."
-                         + evicted_line(evicted), reply_markup=KB)
+                         + evicted_line(evicted), reply_markup=kb)
     else:
         await msg.answer(m.status(), reply_markup=KB)
 
