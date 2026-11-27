@@ -47,9 +47,15 @@ warm = Warm(account)  # заготовка встречи: ссылка сраз
 meetings: dict[str, Meeting] = {}
 
 BTN_NEW, BTN_STOP, BTN_STATUS, BTN_PAUSE = "🎙 Новая встреча", "⏹ Остановить", "📋 Статус", "⏸ Пауза"
-KB = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_STOP)],
-                                   [KeyboardButton(text=BTN_PAUSE), KeyboardButton(text=BTN_STATUS)]],
-                         resize_keyboard=True, is_persistent=True)
+
+
+def main_kb(chat_id: int) -> ReplyKeyboardMarkup:
+    """Кнопки под полем ввода: Пауза/Остановить — только пока идёт встреча
+    (владелец 27.11: «предлагает остановить или продолжить, когда нет звонка»)."""
+    rows = ([[BTN_NEW, BTN_STOP], [BTN_PAUSE, BTN_STATUS]] if live_meetings(chat_id)
+            else [[BTN_NEW, BTN_STATUS]])
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t) for t in r] for r in rows],
+                               resize_keyboard=True, is_persistent=True)
 
 HELP = (
     "Записываю встречи в Яндекс Телемосте.\n\n"
@@ -109,7 +115,8 @@ async def owner_guard(msg: Message) -> bool:
 
 async def send_text(chat_id: int, text: str) -> None:
     for i in range(0, len(text), 4000):
-        await bot.send_message(chat_id, text[i:i + 4000], disable_web_page_preview=True)
+        await bot.send_message(chat_id, text[i:i + 4000], disable_web_page_preview=True,
+                               reply_markup=main_kb(chat_id))
 
 
 async def send_audio(chat_id: int, path: Path, title: str, caption: str) -> None:
@@ -243,7 +250,7 @@ async def cmd_start(msg: Message):
     text = HELP
     if is_owner(msg.from_user.id) and warm.need_login:
         text += "\n\n👉 Сначала войдите в Яндекс, чтобы бот мог создавать встречи: /login"
-    await msg.answer(text, reply_markup=KB)
+    await msg.answer(text, reply_markup=main_kb(msg.chat.id))
 
 
 @dp.message(Command("new"))
@@ -253,7 +260,7 @@ async def cmd_new(msg: Message):
         return
     ok, evicted = make_room()
     if not ok:
-        await msg.answer(BUSY_TEXT, reply_markup=KB)
+        await msg.answer(BUSY_TEXT, reply_markup=main_kb(msg.chat.id))
         return
     prepared = await warm.take(wait=0)  # готовая заготовка — ссылка сразу, без «Создаю…»
     wait = None
@@ -302,7 +309,7 @@ async def cmd_login(msg: Message):
         warm.need_login = False
         warm.ensure()
     await msg.answer(f"✅ Вход в Яндекс есть — «{BTN_NEW}» создаёт встречи" if ok
-                     else "QR не отсканирован за 4 мин. Нажмите /login ещё раз", reply_markup=KB)
+                     else "QR не отсканирован за 4 мин. Нажмите /login ещё раз", reply_markup=main_kb(msg.chat.id))
 
 
 @dp.message(Command("selftest"))
@@ -331,7 +338,7 @@ async def cmd_text(msg: Message):
         return
     new = not want_text(msg.chat.id)
     store.update(lambda d: d["chats"].setdefault(str(msg.chat.id), {}).__setitem__("text", new))
-    await msg.answer("Расшифровка: " + ("вкл" if new else "выкл, только аудио"), reply_markup=KB)
+    await msg.answer("Расшифровка: " + ("вкл" if new else "выкл, только аудио"), reply_markup=main_kb(msg.chat.id))
 
 
 @dp.message(Command("list", "status"))
@@ -341,7 +348,7 @@ async def cmd_status(msg: Message):
         return
     live = live_meetings(msg.chat.id)
     if not live:
-        await msg.answer("Сейчас встреч нет.", reply_markup=KB)
+        await msg.answer("Сейчас встреч нет.", reply_markup=main_kb(msg.chat.id))
         return
     for m in live:
         if m.paused:
@@ -361,11 +368,11 @@ async def cmd_stop(msg: Message):
         return
     live = live_meetings(msg.chat.id)
     if not live:
-        await msg.answer("Сейчас встреч нет.", reply_markup=KB)
+        await msg.answer("Сейчас встреч нет.", reply_markup=main_kb(msg.chat.id))
     elif len(live) == 1:
         # Одна встреча — останавливаем сразу и говорим, что будет дальше.
         live[0].request_stop()
-        await msg.answer(stop_text(live[0]), reply_markup=KB)
+        await msg.answer(stop_text(live[0]), reply_markup=main_kb(msg.chat.id))
     else:
         rows = [[InlineKeyboardButton(text=f"⏹ {m.label} — {m.short_state()}", callback_data=f"stop:{m.id}")] for m in live]
         rows.append([InlineKeyboardButton(text="⏹ Все встречи", callback_data="stop:*")])
@@ -380,7 +387,7 @@ async def cmd_pause(msg: Message):
     live = live_meetings(msg.chat.id)
     pausable = [m for m in live if not m.paused]
     if not live:
-        await msg.answer("Сейчас встреч нет.", reply_markup=KB)
+        await msg.answer("Сейчас встреч нет.", reply_markup=main_kb(msg.chat.id))
     elif not pausable:
         # Всё живое уже на паузе — предложить «продолжить».
         rows = [[InlineKeyboardButton(text=f"▶️ Продолжить {m.label}", callback_data=f"resume:{m.id}")] for m in live]
@@ -425,6 +432,14 @@ async def cb_pause_resume(cq: CallbackQuery):
     action, _, key = cq.data.partition(":")
     mine = live_meetings(cq.message.chat.id)
     targets = mine if key == "*" else [m for m in mine if m.id == key]
+    if not targets:
+        # Кнопки под старой карточкой: встречи уже нет — сказать честно и снять кнопки (владелец 27.11).
+        await cq.answer("Встреча уже закончилась")
+        try:
+            await cq.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
     if action == "pause":
         targets = [m for m in targets if not m.paused]
         if not targets:
@@ -437,9 +452,7 @@ async def cb_pause_resume(cq: CallbackQuery):
     else:
         changed = [m for m in targets if m.request_resume()]
         if not changed:
-            await cq.answer("Уже идёт" if targets else "Встреча закончилась")
-            if not targets:
-                await cq.message.edit_text("Эта встреча уже закончилась.")
+            await cq.answer("Уже идёт")
             return
         await cq.answer("Продолжаю")
         await cq.message.edit_text("\n".join(resume_text(m) for m in changed))
@@ -451,7 +464,7 @@ async def on_text(msg: Message):
     url = telemost.parse_link(text)
     if not url:
         if msg.chat.type == "private" and await guard(msg):
-            await msg.answer(f"Нажмите «{BTN_NEW}» или пришлите ссылку.", reply_markup=KB)
+            await msg.answer(f"Нажмите «{BTN_NEW}» или пришлите ссылку.", reply_markup=main_kb(msg.chat.id))
         return
     if not await guard(msg):
         return
@@ -459,7 +472,7 @@ async def on_text(msg: Message):
     if telemost.meeting_id(url) not in meetings:
         ok, evicted = make_room()
         if not ok:
-            await msg.answer(BUSY_TEXT, reply_markup=KB)
+            await msg.answer(BUSY_TEXT, reply_markup=main_kb(msg.chat.id))
             return
     # Браузер заготовки уже скачал код Телемоста — по своей ссылке бот входит на ~5 с быстрее (замер 17.09).
     prepared = await warm.take(wait=0) if telemost.meeting_id(url) not in meetings else None
@@ -477,7 +490,7 @@ async def on_text(msg: Message):
         await msg.answer(f"🔗 {m.label}: ссылку принял. Запись начнётся сама, как только кто-нибудь зайдёт."
                          + evicted_line(evicted), reply_markup=kb)
     else:
-        await msg.answer(m.status(), reply_markup=KB)
+        await msg.answer(m.status(), reply_markup=main_kb(msg.chat.id))
 
 
 async def setup_branding() -> None:

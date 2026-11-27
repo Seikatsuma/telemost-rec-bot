@@ -105,6 +105,10 @@ class Meeting:
         # может не быть в звонке, иначе он не узнает, что бот добрался. Один раз, перезаход — молча.
         self.confirm_join = confirm_join
         self.join_notified = False
+        # «в зале ожидания» — один раз на серию попыток войти (владелец 27.11: бот повторял вход
+        # каждые ~30 мин и каждый раз слал «впустите» — 4 одинаковых сообщения за ночь).
+        # Сбрасывается после удачного входа: выпал из звонка и снова в зале — сказать ещё раз.
+        self.waiting_notified = False
         # Пауза (владелец 27.11): бот сохраняет запись и ВЫХОДИТ из звонка (экономит процессор),
         # встреча ждёт «продолжить» до конца окна сторожения ссылки. «Остановить» — конец в любой момент.
         self.pause_event = asyncio.Event()
@@ -223,6 +227,7 @@ class Meeting:
                         await self._sleep(min(60, 10 * fails))
                         continue
                     fails = 0
+                    self.waiting_notified = False  # вошёл — следующий зал ожидания скажет ещё раз
                     # В журнал — каждый вход, включая перезаход после обрыва: 18.09 бот перезашёл за 14 с,
                     # но в журнале было пусто, и со стороны это выглядело как зависание на 24 минуты.
                     log.info("%s: бот в звонке (%s)", self.id, "браузер заготовки" if used_warm else "новый браузер")
@@ -303,7 +308,9 @@ class Meeting:
 
     async def _on_waiting(self) -> None:
         self.phase = "в зале ожидания"
-        await self.notify(self.chat_id, f"⏳ {self.label}: бот в зале ожидания — впустите «{config.BOT_NAME}»")
+        if not self.waiting_notified:
+            self.waiting_notified = True
+            await self.notify(self.chat_id, f"⏳ {self.label}: бот в зале ожидания — впустите «{config.BOT_NAME}»")
 
     async def _sleep(self, sec: float) -> None:
         try:
